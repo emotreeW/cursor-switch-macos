@@ -2,9 +2,7 @@
 
 macOS CLI that switches Cursor logins inside the **default** data directory so chat history stays put.
 
-A switch quits Cursor and relaunches it. Live sync between two running windows is not supported.
-
-Unofficial. Cursor can change this storage in any release and the tool will break. Cursor staff have said multiple personal accounts are fine; sharing one account with other people is not.
+A switch quits Cursor and relaunches it. Unofficial; Cursor can change this storage in any release.
 
 ## Prior art
 
@@ -14,7 +12,7 @@ Unofficial. Cursor can change this storage in any release and the tool will brea
 | [keyBeatz/cursor-switch](https://github.com/keyBeatz/cursor-switch) | Same idea: swap tokens, keep chats | Linux only |
 | [reloadlife/cursor-account-switcher](https://github.com/reloadlife/cursor-account-switcher) | Multi-tool CLI (Cursor / Claude / Codex) | Does not import an already-signed-in second user-data-dir |
 
-This tool follows the same public method: replace `cursorAuth/%` and `glass.lastSignedInAuthId` in the default `state.vscdb`. It can also capture a session from a second data dir such as `~/Library/Application Support/Cursor-ProPlus`. It does not copy the chat database.
+This tool follows the same public method: replace `cursorAuth/%` and `glass.lastSignedInAuthId` in the default `state.vscdb`. It can also capture a session from a second data dir such as `~/Library/Application Support/Cursor-ProPlus`.
 
 ## Paths
 
@@ -44,13 +42,6 @@ cursor-switch to super
 ```
 
 `to` refreshes the saved session for whoever is currently in the default dir before swapping, so a just-rotated token is not lost.
-
-## Out of scope
-
-- Two running Cursor processes sharing one SQLite file (that corrupts the DB)
-- Backing up the full `state.vscdb` (it can be tens of GB)
-- Touching the Keychain item `Cursor Safe Storage` (Electron encryption key, not the login JWT)
-- Committing tokens to this repository
 
 ## License
 
