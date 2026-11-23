@@ -1,8 +1,18 @@
 # cursor-switch
 
-One macOS CLI and one Cursor extension for the two logins on this machine. Keep them in **this repository**. Do not split “open the other window”, chat sync, login swap, and DeepSeek into separate GitHub repos or separate extensions.
+macOS CLI plus one Cursor extension. All of it lives in this repo: opening the other window, copying chats, swapping the default login, and the DeepSeek / Grok chip.
 
-Unofficial. Cursor can change this storage in any release.
+Unofficial. Cursor can change how it stores logins and chats.
+
+## Two accounts
+
+| | Super | Pro+ |
+| --- | --- | --- |
+| Typical email | Gmail login | QQ login |
+| Data dir | `~/Library/Application Support/Cursor` | `~/Library/Application Support/Cursor-ProPlus` |
+| How it runs | Normal Cursor (this window) | Second instance with `--user-data-dir` |
+
+Do not start a second copy of the default dir. Two writers on one `state.vscdb` can corrupt it.
 
 ## Install
 
@@ -10,63 +20,83 @@ Unofficial. Cursor can change this storage in any release.
 ./install.sh
 ```
 
-Reload the Cursor window (`Developer: Reload Window`). The account chip on the status bar opens a menu:
+Then **Developer: Reload Window**.
 
-- **Open other window** — keep this window; focus the other account or launch it. Super uses the default data dir; Pro+ uses `--user-data-dir` `~/Library/Application Support/Cursor-ProPlus`. Never launches a second copy of the default dir (two writers on one `state.vscdb` corrupt it).
-- **Sync chats** — copy this workspace's recently used threads (full history) from the default Super database **into Cursor-ProPlus only**. It never writes the 31 GB default `state.vscdb` chat tables. Then it quits and reopens the Pro+ window only.
-- **Switch login** — quit this window and swap the login inside the default data dir.
-
-A second chip shows **Grok** or **DeepSeek** and clicks Cursor's own `Toggle OpenAI key` (`Cmd+Shift+0`). Cursor still has no per-model base URL: Grok and DeepSeek cannot stay on at the same time. After a toggle, pick the matching model in the current chat.
-
-**Sync** copies every chat in this workspace whose thread was used in the last 7 days, including the full history of that thread. It does not copy other workspaces, and it does not copy threads that sat idle for more than 7 days. If the payload would exceed 80 MB it keeps the newest threads and can fall back to “used in the last 4 days”. The other Cursor window is quit, its database is written, then that window is relaunched. This window stays open. Two Cursors never write the same `state.vscdb` at once. If the destination already has a newer copy of the same chat, that copy is left alone. Replaced destination rows are saved under `~/.config/cursor-switch/sync/backups/`. Workspace files on disk are not part of this sync.
-
-Command Palette:
-
-- `Cursor Switch: Account Menu`
-- `Cursor Switch: Open Other Window`
-- `Cursor Switch: Toggle Account`
-- `Cursor Switch: Switch to Super`
-- `Cursor Switch: Switch to Pro+`
-- `Cursor Switch: Toggle DeepSeek / Grok`
-- `Cursor Switch: Sync This Workspace's Recent Chats`
-
-First-time capture (already done on this machine):
+First-time login capture (already done on this machine):
 
 ```bash
 cursor-switch capture super
 cursor-switch capture proplus --from "$HOME/Library/Application Support/Cursor-ProPlus"
 ```
 
-CLI:
+Saved sessions stay in `~/.config/cursor-switch/accounts/` (not in git).
+
+## Status bar
+
+After reload you should see two chips at the bottom right.
+
+**Account chip** (`super` / `proplus`) — click it, then pick one:
+
+1. **Open other window**  
+   This window stays. If the other account is already running, it comes to the front. If not, Pro+ launches with `--user-data-dir` pointing at `Cursor-ProPlus`. It does not open a second Super.
+
+2. **Sync chats**  
+   Copies chats **from Super into Pro+ only**. It never writes Super’s chat tables.  
+   Which chats: this workspace, threads that were used in the last 7 days, **full history of each of those threads** (not “only the last 7 days of messages”). Idle threads and other folders are skipped. If the bundle would exceed 80 MB, it keeps the newest threads and may use 4 days.  
+   Pro+ is quit, its database is written, then Pro+ reopens. Super stays open.  
+   If Pro+ already has the same thread and that copy is newer, that copy is left alone. Rows that do get replaced are saved under `~/.config/cursor-switch/sync/backups/`.  
+   Project files on disk are not copied.
+
+3. **Switch login**  
+   Quits **this** (default) Cursor, replaces only `cursorAuth/%` and `glass.lastSignedInAuthId` in the default `state.vscdb`, then relaunches Super. Chat tables are not deleted. Pro+ is not quit.
+
+**Grok / DeepSeek chip** — clicks Cursor’s own `Toggle OpenAI key` (`Cmd+Shift+0`). That override is global: with it on, Grok is sent to your DeepSeek endpoint. After a toggle, pick `deepseek-flash` or Grok in the current chat. This chip does not open a new chat and does not write chat tables.
+
+Command Palette names match the same actions (`Cursor Switch: …`).
+
+## CLI
 
 ```bash
+cursor-switch status --json
 cursor-switch open-other --from-dir "$HOME/Library/Application Support/Cursor" --folder "$PWD"
-cursor-switch toggle
 cursor-switch sync-chats \
   --from-dir "$HOME/Library/Application Support/Cursor" \
   --to-dir "$HOME/Library/Application Support/Cursor-ProPlus" \
   --folder "$PWD" \
   --days 7 \
-  --max-mb 80
+  --max-mb 80 \
+  --dry-run
+cursor-switch toggle
 ```
 
-Add `--dry-run` to print the chat list without writing.
+`--dry-run` prints the chat list and writes nothing. `sync-chats` refuses to use the default data dir as `--to-dir`.
 
-## Prior art
+## What this will not do
 
-| Repo | What it does | Gap |
-| --- | --- | --- |
-| [xorostar/multicursor](https://github.com/xorostar/multicursor) | Mac menu bar; writes `cursorAuth/*` plus Keychain, then restarts Cursor | Captures only from the default data dir; cannot import a second `--user-data-dir` |
-| [keyBeatz/cursor-switch](https://github.com/keyBeatz/cursor-switch) | Same idea: swap tokens, keep chats | Linux only |
-| [reloadlife/cursor-account-switcher](https://github.com/reloadlife/cursor-account-switcher) | Multi-tool CLI (Cursor / Claude / Codex) | Does not import an already-signed-in second user-data-dir |
-
-This tool follows the same public method: replace `cursorAuth/%` and `glass.lastSignedInAuthId` in the default `state.vscdb`. It can also capture a session from a second data dir such as `~/Library/Application Support/Cursor-ProPlus`.
+- Delete Super’s conversation list
+- Copy other workspaces, or threads unused for more than 7 days
+- Merge two diverged copies of the same thread
+- Sync files in the project folder
+- Let Grok and DeepSeek stay on at the same time (Cursor has no per-model base URL)
 
 ## Paths
 
-- Chats and current login: `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
-- Captured sessions (local, not in git): `~/.config/cursor-switch/accounts/`
-- Optional second instance: `~/Library/Application Support/Cursor-ProPlus`
+| What | Where |
+| --- | --- |
+| Super chats and Super login | `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` |
+| Pro+ chats and Pro+ login | `~/Library/Application Support/Cursor-ProPlus/User/globalStorage/state.vscdb` |
+| Captured logins, sync backups | `~/.config/cursor-switch/` |
+| Pro+ extensions dir | `~/.cursor-proplus/extensions` |
+
+## Prior art
+
+Same public method as other switchers: swap `cursorAuth/%` in `state.vscdb`. This repo also opens a second `--user-data-dir`, copies one workspace’s recent threads into Pro+, and drives Cursor’s OpenAI-key toggle.
+
+| Repo | Difference |
+| --- | --- |
+| [xorostar/multicursor](https://github.com/xorostar/multicursor) | Default data dir only |
+| [keyBeatz/cursor-switch](https://github.com/keyBeatz/cursor-switch) | Linux |
+| [reloadlife/cursor-account-switcher](https://github.com/reloadlife/cursor-account-switcher) | Does not import an already-signed-in second data dir |
 
 ## License
 
