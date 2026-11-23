@@ -1,8 +1,8 @@
 {
   "name": "cursor-switch",
   "displayName": "Cursor Switch",
-  "description": "Switch Cursor logins in the default data directory from the status bar.",
-  "version": "0.0.4",
+  "description": "Open the other Cursor account, sync this workspace's chats, switch login, and toggle DeepSeek.",
+  "version": "0.0.5",
   "publisher": "emotreeW",
   "license": "MIT",
   "engines": {
@@ -13,6 +13,16 @@
   "main": "./extension.js",
   "contributes": {
     "commands": [
+      {
+        "command": "cursorSwitch.menu",
+        "title": "Account Menu",
+        "category": "Cursor Switch"
+      },
+      {
+        "command": "cursorSwitch.openOther",
+        "title": "Open Other Window",
+        "category": "Cursor Switch"
+      },
       {
         "command": "cursorSwitch.toggle",
         "title": "Toggle Account",

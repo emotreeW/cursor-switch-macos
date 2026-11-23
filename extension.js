@@ -80,7 +80,7 @@ async function activate(context) {
     vscode.StatusBarAlignment.Right,
     100
   );
-  item.command = "cursorSwitch.toggle";
+  item.command = "cursorSwitch.menu";
   context.subscriptions.push(item);
 
   const byokItem = vscode.window.createStatusBarItem(
@@ -89,17 +89,6 @@ async function activate(context) {
   );
   byokItem.command = "cursorSwitch.toggleDeepSeek";
   context.subscriptions.push(byokItem);
-
-  const syncItem = vscode.window.createStatusBarItem(
-    vscode.StatusBarAlignment.Right,
-    102
-  );
-  syncItem.command = "cursorSwitch.syncChats";
-  syncItem.text = "$(sync) Sync";
-  syncItem.tooltip =
-    "Copy this workspace's chats from the last 7 days to the other Cursor window. Quits that window, writes its database, then reopens it.";
-  syncItem.show();
-  context.subscriptions.push(syncItem);
 
   const dbPath = stateDbPath(context);
 
@@ -110,8 +99,8 @@ async function activate(context) {
       const label = info.membership || info.name || "cursor";
       item.text = `$(account) ${label}`;
       item.tooltip = info.email
-        ? `${info.email}  ·  click to switch`
-        : "click to switch";
+        ? `${info.email}  ·  open other window, sync chats, or switch login`
+        : "open other window, sync chats, or switch login";
       item.show();
     } catch (err) {
       item.text = "$(account) cursor-switch";
@@ -122,7 +111,7 @@ async function activate(context) {
 
   async function switchAccount(args, label) {
     const choice = await vscode.window.showWarningMessage(
-      `Quit Cursor and switch to ${label}? Unsaved files follow the normal quit prompt.`,
+      `Quit this Cursor and switch the default login to ${label}? Unsaved files follow the normal quit prompt. To keep this window and open the other account, pick Open other window.`,
       { modal: true },
       "Switch"
     );
@@ -130,6 +119,59 @@ async function activate(context) {
       return;
     }
     startSwitch(context, args);
+  }
+
+  async function openOther() {
+    const fromDir = dataDirFromExtension(context);
+    const folders = vscode.workspace.workspaceFolders;
+    const args = ["open-other", "--from-dir", fromDir];
+    if (folders && folders.length) {
+      args.push("--folder", folders[0].uri.fsPath);
+    }
+    const { stdout } = await execFileAsync(cliPath(context), args, {
+      timeout: 20000,
+    });
+    const info = JSON.parse(String(stdout || "{}"));
+    vscode.window.showInformationMessage(
+      info.action === "focus"
+        ? `Brought the other Cursor (${info.kind}) to the front.`
+        : `Opened the other Cursor (${info.kind}).`
+    );
+  }
+
+  async function showMenu() {
+    const picked = await vscode.window.showQuickPick(
+      [
+        {
+          label: "$(window) Open other window",
+          description: "Keep this window. Focus or launch the other account.",
+          id: "open",
+        },
+        {
+          label: "$(sync) Sync chats",
+          description: "Copy this workspace's recent threads into the other account.",
+          id: "sync",
+        },
+        {
+          label: "$(account) Switch login",
+          description: "Quit this window and swap the default Cursor login.",
+          id: "switch",
+        },
+      ],
+      { placeHolder: "This window stays open unless you switch login" }
+    );
+    if (!picked) {
+      return;
+    }
+    if (picked.id === "open") {
+      await openOther();
+      return;
+    }
+    if (picked.id === "sync") {
+      await vscode.commands.executeCommand("cursorSwitch.syncChats");
+      return;
+    }
+    await switchAccount(["toggle"], "the other account");
   }
 
   async function refreshByok() {
@@ -184,6 +226,8 @@ async function activate(context) {
   }
 
   context.subscriptions.push(
+    vscode.commands.registerCommand("cursorSwitch.menu", () => showMenu()),
+    vscode.commands.registerCommand("cursorSwitch.openOther", () => openOther()),
     vscode.commands.registerCommand("cursorSwitch.toggle", () =>
       switchAccount(["toggle"], "the other account")
     ),
@@ -207,7 +251,7 @@ async function activate(context) {
       const toDir = otherDataDir(fromDir);
       const folder = folders[0].uri.fsPath;
       const choice = await vscode.window.showWarningMessage(
-        `Copy this workspace's chats from the last 7 days into the other Cursor, then quit and reopen that window only? This window stays open. Destination chats that are newer are left alone.`,
+        `Copy every chat in this workspace that was used in the last 7 days (the full thread, not just the last week's messages), then quit and reopen the other window? This window stays open. Destination chats that are newer are left alone.`,
         { modal: true },
         "Sync"
       );

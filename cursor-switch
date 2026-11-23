@@ -151,24 +151,35 @@ def quit_cursor(timeout: float = 40.0) -> None:
     )
 
 
-def launch_default_cursor() -> None:
-    subprocess.run(["open", "-a", "Cursor"], check=True)
+def launch_default_cursor(folder: Path | None = None) -> None:
+    if folder is None:
+        subprocess.run(["open", "-a", "Cursor"], check=True)
+        return
+    subprocess.run(["open", "-a", "Cursor", str(folder)], check=True)
 
 
-def launch_proplus_cursor() -> None:
-    subprocess.run(
-        [
-            "open",
-            "-n",
-            "-a",
-            "Cursor",
-            "--args",
-            f"--user-data-dir={PROPLUS_DATA_DIR}",
-            f"--extensions-dir={PROPLUS_EXT_DIR}",
-            "--disable-updates",
-        ],
-        check=True,
+def launch_proplus_cursor(folder: Path | None = None) -> None:
+    cmd = [
+        "open",
+        "-n",
+        "-a",
+        "Cursor",
+        "--args",
+        f"--user-data-dir={PROPLUS_DATA_DIR}",
+        f"--extensions-dir={PROPLUS_EXT_DIR}",
+        "--disable-updates",
+    ]
+    if folder is not None:
+        cmd.append(str(folder))
+    subprocess.run(cmd, check=True)
+
+
+def focus_pid(pid: int) -> None:
+    script = (
+        "tell application \"System Events\" to set frontmost of "
+        f"(first process whose unix id is {int(pid)}) to true"
     )
+    subprocess.run(["osascript", "-e", script], check=False, capture_output=True)
 
 
 def classify_cursor_pid(pid: int) -> str:
@@ -214,13 +225,38 @@ def quit_kind(kind: str, timeout: float = 40.0) -> None:
     )
 
 
-def launch_kind(kind: str) -> None:
+def launch_kind(kind: str, folder: Path | None = None) -> None:
     if kind == "proplus":
-        launch_proplus_cursor()
+        launch_proplus_cursor(folder)
         return
     if pids_for("default"):
+        if folder is not None:
+            launch_default_cursor(folder)
         return
-    launch_default_cursor()
+    launch_default_cursor(folder)
+
+
+def other_kind(kind: str) -> str:
+    return "proplus" if kind == "default" else "default"
+
+
+def cmd_open_other(args: argparse.Namespace) -> None:
+    from_dir = Path(args.from_dir).expanduser().resolve()
+    folder = Path(args.folder).expanduser().resolve() if args.folder else None
+    dest = other_kind(data_dir_kind(from_dir))
+    pids = pids_for(dest)
+    if pids:
+        focus_pid(pids[0])
+        if dest == "default" and folder is not None:
+            launch_default_cursor(folder)
+        print(
+            json.dumps(
+                {"ok": True, "action": "focus", "kind": dest, "pid": pids[0]}
+            )
+        )
+        return
+    launch_kind(dest, folder)
+    print(json.dumps({"ok": True, "action": "launch", "kind": dest}))
 
 
 def acquire_sync_lock() -> int:
@@ -833,6 +869,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = sub.add_parser("toggle", help="quit Cursor and switch to the other saved account")
     g.set_defaults(func=cmd_toggle)
+
+    o = sub.add_parser(
+        "open-other",
+        help="focus or launch the other Cursor window; do not quit this one",
+    )
+    o.add_argument("--from-dir", required=True)
+    o.add_argument("--folder", default=None)
+    o.set_defaults(func=cmd_open_other)
 
     y = sub.add_parser(
         "sync-chats",
