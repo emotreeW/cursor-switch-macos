@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""Switch Cursor accounts on macOS by swapping login rows in the default data dir.
+
+Chat history stays in ~/Library/Application Support/Cursor. Only cursorAuth/*
+and glass.lastSignedInAuthId are replaced. Cursor must fully quit before a
+switch, or WAL replay will overwrite the write.
+
+Unofficial. Cursor can change this storage in any release.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+DEFAULT_DATA_DIR = HOME / "Library/Application Support/Cursor"
+PROPLUS_DATA_DIR = HOME / "Library/Application Support/Cursor-ProPlus"
+STATE_REL = Path("User/globalStorage/state.vscdb")
+STORE_DIR = HOME / ".config/cursor-switch"
+ACCOUNTS_DIR = STORE_DIR / "accounts"
+CURSOR_APP = Path("/Applications/Cursor.app")
+CURSOR_BIN = CURSOR_APP / "Contents/MacOS/Cursor"
+
+AUTH_SQL = (
+    "key LIKE 'cursorAuth/%' OR key = 'glass.lastSignedInAuthId'"
+)
+
+
+def state_db(data_dir: Path) -> Path:
+    return data_dir / STATE_REL
+
+
+def account_path(name: str) -> Path:
+    if not name or "/" in name or name in (".", ".."):
+        raise SystemExit(f"bad account name: {name!r}")
+    return ACCOUNTS_DIR / f"{name}.json"
+
+
+def connect(db_path: Path, readonly: bool) -> sqlite3.Connection:
+    if not db_path.exists():
+        raise SystemExit(f"state.vscdb not found: {db_path}")
+    uri = db_path.as_uri()
+    if readonly:
+        con = sqlite3.connect(f"{uri}?mode=ro", uri=True, timeout=10)
+    else:
+        con = sqlite3.connect(str(db_path), timeout=30)
+        con.execute("PRAGMA busy_timeout = 30000")
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def read_auth_rows(data_dir: Path) -> dict[str, str]:
+    con = connect(state_db(data_dir), readonly=True)
+    try:
+        rows = con.execute(
+            f"SELECT key, value FROM ItemTable WHERE {AUTH_SQL}"
+        ).fetchall()
+    finally:
+        con.close()
+    out: dict[str, str] = {}
+    for row in rows:
+        value = row["value"]
+        if value is None:
+            continue
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        out[row["key"]] = value
+    return out
+
+
+def write_auth_rows(data_dir: Path, keys: dict[str, str]) -> None:
+    db = state_db(data_dir)
+    con = connect(db, readonly=False)
+    try:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.execute(f"DELETE FROM ItemTable WHERE {AUTH_SQL}")
+        con.executemany(
+            "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+            list(keys.items()),
+        )
+        con.commit()
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        result = con.execute("PRAGMA integrity_check").fetchone()
+        if not result or result[0] != "ok":
+            raise SystemExit(f"integrity_check failed: {result}")
+    finally:
+        con.close()
+
+
+def summarize(keys: dict[str, str]) -> dict[str, str]:
+    return {
+        "email": keys.get("cursorAuth/cachedEmail", ""),
+        "membership": keys.get("cursorAuth/stripeMembershipType", ""),
+        "status": keys.get("cursorAuth/stripeSubscriptionStatus", ""),
+    }
+
+
+def cursor_pids() -> list[int]:
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", str(CURSOR_BIN)], text=True
+        )
+    except subprocess.CalledProcessError:
+        return []
+    pids = []
+    for line in out.split():
+        try:
+            pids.append(int(line))
+        except ValueError:
+            continue
+    return pids
+
+
+def quit_cursor(timeout: float = 40.0) -> None:
+    pids = cursor_pids()
+    if not pids:
+        return
+    subprocess.run(
+        ["osascript", "-e", 'tell application "Cursor" to quit'],
+        check=False,
+        capture_output=True,
+    )
+    deadline = time.time() + timeout
+    force_after = time.time() + timeout / 2
+    while time.time() < deadline:
+        pids = cursor_pids()
+        if not pids:
+            return
+        if time.time() > force_after:
+            subprocess.run(["kill", "-9", *map(str, pids)], check=False)
+            force_after = deadline + 1
+        time.sleep(0.3)
+    raise SystemExit(
+        "Cursor did not quit. Close every Cursor window, then run again."
+    )
+
+
+def launch_default_cursor() -> None:
+    subprocess.run(["open", "-a", "Cursor"], check=True)
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    keys = read_auth_rows(DEFAULT_DATA_DIR)
+    info = summarize(keys)
+    print(f"data dir: {DEFAULT_DATA_DIR}")
+    print(f"email:    {info['email'] or '(none)'}")
+    print(f"plan:     {info['membership'] or '(unknown)'} {info['status']}".rstrip())
+    print(f"running:  {'yes' if cursor_pids() else 'no'}")
+
+
+def cmd_capture(args: argparse.Namespace) -> None:
+    data_dir = Path(args.from_dir).expanduser() if args.from_dir else DEFAULT_DATA_DIR
+    keys = read_auth_rows(data_dir)
+    if "cursorAuth/accessToken" not in keys:
+        raise SystemExit(f"no cursorAuth/accessToken in {data_dir}")
+    ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(STORE_DIR, 0o700)
+    os.chmod(ACCOUNTS_DIR, 0o700)
+    payload = {
+        "name": args.name,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "source": str(data_dir),
+        **summarize(keys),
+        "keys": keys,
+    }
+    path = account_path(args.name)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    info = summarize(keys)
+    print(f"saved {args.name}: {info['email']} ({info['membership']}) <- {data_dir}")
+
+
+def cmd_list(_args: argparse.Namespace) -> None:
+    if not ACCOUNTS_DIR.exists():
+        print("no saved accounts")
+        return
+    files = sorted(ACCOUNTS_DIR.glob("*.json"))
+    if not files:
+        print("no saved accounts")
+        return
+    for path in files:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        print(
+            f"{data.get('name', path.stem):12}  "
+            f"{data.get('email', ''):32}  "
+            f"{data.get('membership', ''):12}  "
+            f"{data.get('captured_at', '')}"
+        )
+
+
+def load_account(name: str) -> dict:
+    path = account_path(name)
+    if not path.exists():
+        raise SystemExit(
+            f"no saved account {name!r}. capture it first: cursor-switch capture {name}"
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def refresh_if_logged_in(name_guess: str | None) -> None:
+    """Write the live default-DB session back onto the matching saved account."""
+    try:
+        live = read_auth_rows(DEFAULT_DATA_DIR)
+    except SystemExit:
+        return
+    email = live.get("cursorAuth/cachedEmail", "")
+    if not email:
+        return
+    target_name = name_guess
+    if ACCOUNTS_DIR.exists():
+        for path in ACCOUNTS_DIR.glob("*.json"):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("email") == email:
+                target_name = data.get("name") or path.stem
+                break
+    if not target_name:
+        return
+    path = account_path(target_name)
+    if not path.exists():
+        return
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["captured_at"] = datetime.now(timezone.utc).isoformat()
+    data["source"] = str(DEFAULT_DATA_DIR)
+    data.update(summarize(live))
+    data["keys"] = live
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    print(f"refreshed saved session for {target_name} ({email})")
+
+
+def cmd_to(args: argparse.Namespace) -> None:
+    target = load_account(args.name)
+    keys = target.get("keys") or {}
+    if "cursorAuth/accessToken" not in keys:
+        raise SystemExit(f"saved account {args.name!r} has no accessToken")
+    refresh_if_logged_in(None)
+    print(
+        f"switching default Cursor to {target.get('email')} "
+        f"({target.get('membership')})"
+    )
+    print("quitting Cursor (this window will close)")
+    quit_cursor()
+    write_auth_rows(DEFAULT_DATA_DIR, keys)
+    launch_default_cursor()
+    print("relaunched Cursor with the default data directory (all chats stay)")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="cursor-switch",
+        description="Swap Cursor login in the default macOS data dir; keep chats.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("status", help="show who the default Cursor data dir is signed in as")
+    s.set_defaults(func=cmd_status)
+
+    c = sub.add_parser("capture", help="save login rows from a Cursor data dir")
+    c.add_argument("name")
+    c.add_argument(
+        "--from",
+        dest="from_dir",
+        default=None,
+        help="Cursor --user-data-dir (default: Application Support/Cursor)",
+    )
+    c.set_defaults(func=cmd_capture)
+
+    l = sub.add_parser("list", help="list saved accounts (email/plan only)")
+    l.set_defaults(func=cmd_list)
+
+    t = sub.add_parser("to", help="quit Cursor, write saved login into the default dir, relaunch")
+    t.add_argument("name")
+    t.set_defaults(func=cmd_to)
+
+    return p
+
+
+def main() -> None:
+    if sys.platform != "darwin":
+        raise SystemExit("this tool is for macOS")
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
