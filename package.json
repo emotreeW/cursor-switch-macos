@@ -2,7 +2,7 @@
   "name": "cursor-switch",
   "displayName": "Cursor Switch",
   "description": "Switch Cursor logins in the default data directory from the status bar.",
-  "version": "0.0.1",
+  "version": "0.0.4",
   "publisher": "emotreeW",
   "license": "MIT",
   "engines": {
@@ -26,6 +26,16 @@
       {
         "command": "cursorSwitch.to.proplus",
         "title": "Switch to Pro+",
+        "category": "Cursor Switch"
+      },
+      {
+        "command": "cursorSwitch.toggleDeepSeek",
+        "title": "Toggle DeepSeek / Grok",
+        "category": "Cursor Switch"
+      },
+      {
+        "command": "cursorSwitch.syncChats",
+        "title": "Sync This Workspace's Recent Chats",
         "category": "Cursor Switch"
       }
     ]

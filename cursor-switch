@@ -17,8 +17,10 @@ import sqlite3
 import subprocess
 import sys
 import time
+import fcntl
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 HOME = Path.home()
 DEFAULT_DATA_DIR = HOME / "Library/Application Support/Cursor"
@@ -26,8 +28,14 @@ PROPLUS_DATA_DIR = HOME / "Library/Application Support/Cursor-ProPlus"
 STATE_REL = Path("User/globalStorage/state.vscdb")
 STORE_DIR = HOME / ".config/cursor-switch"
 ACCOUNTS_DIR = STORE_DIR / "accounts"
+SYNC_DIR = STORE_DIR / "sync"
 CURSOR_APP = Path("/Applications/Cursor.app")
 CURSOR_BIN = CURSOR_APP / "Contents/MacOS/Cursor"
+PROPLUS_EXT_DIR = HOME / ".cursor-proplus/extensions"
+HEADER_CHUNK_PAD = 6
+DEFAULT_SYNC_DAYS = 7
+FALLBACK_SYNC_DAYS = 4
+DEFAULT_MAX_MB = 80
 
 AUTH_SQL = (
     "key LIKE 'cursorAuth/%' OR key = 'glass.lastSignedInAuthId'"
@@ -145,6 +153,487 @@ def quit_cursor(timeout: float = 40.0) -> None:
 
 def launch_default_cursor() -> None:
     subprocess.run(["open", "-a", "Cursor"], check=True)
+
+
+def launch_proplus_cursor() -> None:
+    subprocess.run(
+        [
+            "open",
+            "-n",
+            "-a",
+            "Cursor",
+            "--args",
+            f"--user-data-dir={PROPLUS_DATA_DIR}",
+            f"--extensions-dir={PROPLUS_EXT_DIR}",
+            "--disable-updates",
+        ],
+        check=True,
+    )
+
+
+def classify_cursor_pid(pid: int) -> str:
+    try:
+        out = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "command="], text=True
+        )
+    except subprocess.CalledProcessError:
+        return "unknown"
+    if "Cursor-ProPlus" in out:
+        return "proplus"
+    return "default"
+
+
+def pids_for(kind: str) -> list[int]:
+    return [pid for pid in cursor_pids() if classify_cursor_pid(pid) == kind]
+
+
+def data_dir_kind(data_dir: Path) -> str:
+    resolved = data_dir.resolve()
+    if resolved == PROPLUS_DATA_DIR.resolve():
+        return "proplus"
+    return "default"
+
+
+def quit_kind(kind: str, timeout: float = 40.0) -> None:
+    pids = pids_for(kind)
+    if not pids:
+        return
+    subprocess.run(["kill", "-15", *map(str, pids)], check=False)
+    deadline = time.time() + timeout
+    force_after = time.time() + timeout / 2
+    while time.time() < deadline:
+        pids = pids_for(kind)
+        if not pids:
+            return
+        if time.time() > force_after:
+            subprocess.run(["kill", "-9", *map(str, pids)], check=False)
+            force_after = deadline + 1
+        time.sleep(0.3)
+    raise SystemExit(
+        f"{kind} Cursor did not quit. Close that window, then run again."
+    )
+
+
+def launch_kind(kind: str) -> None:
+    if kind == "proplus":
+        launch_proplus_cursor()
+        return
+    if pids_for("default"):
+        return
+    launch_default_cursor()
+
+
+def acquire_sync_lock() -> int:
+    SYNC_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(STORE_DIR, 0o700)
+    lock_path = SYNC_DIR / "sync.lock"
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise SystemExit("another sync is already running")
+    os.write(fd, f"{os.getpid()}\n".encode())
+    return fd
+
+
+def release_sync_lock(fd: int) -> None:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+
+def folder_from_file_uri(uri: str) -> str:
+    if not uri:
+        return ""
+    parsed = urlparse(uri)
+    return unquote(parsed.path)
+
+
+def workspace_id_for_folder(data_dir: Path, folder: Path) -> str | None:
+    wanted = str(folder.expanduser().resolve())
+    root = data_dir / "User" / "workspaceStorage"
+    if not root.exists():
+        return None
+    for path in root.glob("*/workspace.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        got = folder_from_file_uri(str(data.get("folder") or ""))
+        if got == wanted or os.path.normpath(got) == wanted:
+            return path.parent.name
+    return None
+
+
+def ensure_workspace_json(data_dir: Path, workspace_id: str, folder: Path) -> None:
+    dest = data_dir / "User" / "workspaceStorage" / workspace_id
+    dest.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "folder": folder.expanduser().resolve().as_uri(),
+    }
+    path = dest / "workspace.json"
+    if path.exists():
+        return
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+
+def header_name(value: str | bytes | None) -> str:
+    if not value:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    try:
+        return str(json.loads(value).get("name") or "")
+    except json.JSONDecodeError:
+        return ""
+
+
+def kv_get(con: sqlite3.Connection, key: str) -> bytes | str | None:
+    row = con.execute(
+        "SELECT value FROM cursorDiskKV WHERE key = ?", (key,)
+    ).fetchone()
+    if row is None:
+        return None
+    return row["value"]
+
+
+def kv_len(con: sqlite3.Connection, key: str) -> int:
+    row = con.execute(
+        "SELECT length(value) AS n FROM cursorDiskKV WHERE key = ?", (key,)
+    ).fetchone()
+    return int(row["n"] or 0) if row else 0
+
+
+def chunk_count_from_composer_data(raw: bytes | str | None) -> int:
+    if raw is None:
+        return 0
+    if isinstance(raw, bytes):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return 0
+    else:
+        text = raw
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return 0
+    log = data.get("headerLog") or {}
+    try:
+        return int(log.get("chunkCount") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def conv_header_key(composer_id: str, index: int) -> str:
+    return f"composerConvHeaders:{composer_id}:{str(index).zfill(HEADER_CHUNK_PAD)}"
+
+
+def extra_composer_keys(composer_id: str) -> list[str]:
+    return [
+        f"composerData:{composer_id}",
+        f"composerDraft:{composer_id}",
+        f"composerTranscriptHeightTail:{composer_id}",
+        f"composerTranscriptHeightTailIde:{composer_id}",
+    ]
+
+
+def collect_chat_keys(
+    con: sqlite3.Connection, composer_id: str
+) -> list[tuple[str, bytes | str]]:
+    out: list[tuple[str, bytes | str]] = []
+    data = None
+    for key in extra_composer_keys(composer_id):
+        value = kv_get(con, key)
+        if value is None:
+            continue
+        out.append((key, value))
+        if key.startswith("composerData:"):
+            data = value
+    n_chunks = chunk_count_from_composer_data(data)
+    for index in range(n_chunks):
+        key = conv_header_key(composer_id, index)
+        value = kv_get(con, key)
+        if value is None:
+            continue
+        out.append((key, value))
+    return out
+
+
+def chat_payload_size(con: sqlite3.Connection, composer_id: str, header_value) -> int:
+    size = len(header_value or "")
+    data = kv_get(con, f"composerData:{composer_id}")
+    if data is not None:
+        size += len(data)
+    n_chunks = chunk_count_from_composer_data(data)
+    for index in range(n_chunks):
+        size += kv_len(con, conv_header_key(composer_id, index))
+    for key in extra_composer_keys(composer_id)[1:]:
+        size += kv_len(con, key)
+    return size
+
+
+def list_workspace_chats(
+    con: sqlite3.Connection, workspace_id: str
+) -> list[sqlite3.Row]:
+    return con.execute(
+        """
+        SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+               isSubagent, recency, checkpointAt, value, subagentTypeName
+        FROM composerHeaders
+        WHERE workspaceId = ?
+          AND ifnull(isSubagent, 0) = 0
+          AND ifnull(isArchived, 0) = 0
+        ORDER BY lastUpdatedAt DESC
+        """,
+        (workspace_id,),
+    ).fetchall()
+
+
+def cutoff_ms(days: int) -> int:
+    return int(time.time() * 1000) - days * 86400 * 1000
+
+
+def pick_chats(
+    con: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    days: int,
+    max_bytes: int,
+) -> tuple[list[sqlite3.Row], int, int]:
+    used_days = days
+    chosen = [row for row in rows if int(row["lastUpdatedAt"] or 0) >= cutoff_ms(days)]
+    if not chosen and days != FALLBACK_SYNC_DAYS:
+        used_days = FALLBACK_SYNC_DAYS
+        chosen = [
+            row
+            for row in rows
+            if int(row["lastUpdatedAt"] or 0) >= cutoff_ms(FALLBACK_SYNC_DAYS)
+        ]
+    sized: list[tuple[sqlite3.Row, int]] = []
+    total = 0
+    for row in chosen:
+        nbytes = chat_payload_size(con, row["composerId"], row["value"])
+        sized.append((row, nbytes))
+        total += nbytes
+    if total <= max_bytes:
+        return [row for row, _ in sized], total, used_days
+    sized.sort(key=lambda item: int(item[0]["lastUpdatedAt"] or 0), reverse=True)
+    kept: list[sqlite3.Row] = []
+    total = 0
+    for row, nbytes in sized:
+        if kept and total + nbytes > max_bytes:
+            break
+        kept.append(row)
+        total += nbytes
+    return kept, total, used_days
+
+
+def dest_header_map(con: sqlite3.Connection, ids: list[str]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    if not ids:
+        return out
+    qmarks = ",".join("?" * len(ids))
+    rows = con.execute(
+        f"SELECT composerId, lastUpdatedAt FROM composerHeaders WHERE composerId IN ({qmarks})",
+        ids,
+    ).fetchall()
+    for row in rows:
+        out[row["composerId"]] = int(row["lastUpdatedAt"] or 0)
+    return out
+
+
+def backup_dest_chats(
+    dest_con: sqlite3.Connection, composer_ids: list[str]
+) -> Path | None:
+    if not composer_ids:
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = SYNC_DIR / "backups" / f"{stamp}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(SYNC_DIR, 0o700)
+    payload = []
+    for composer_id in composer_ids:
+        row = dest_con.execute(
+            "SELECT * FROM composerHeaders WHERE composerId = ?",
+            (composer_id,),
+        ).fetchone()
+        if row is None:
+            continue
+        keys = collect_chat_keys(dest_con, composer_id)
+        encoded_keys = []
+        for key, value in keys:
+            if isinstance(value, bytes):
+                encoded_keys.append({"key": key, "encoding": "latin1", "value": value.decode("latin1")})
+            else:
+                encoded_keys.append({"key": key, "encoding": "utf-8", "value": value})
+        payload.append(
+            {
+                "header": {k: row[k] for k in row.keys()},
+                "keys": encoded_keys,
+            }
+        )
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    return path
+
+
+def write_chats(
+    dest_con: sqlite3.Connection,
+    headers: list[dict],
+    kv_rows: dict[str, list[tuple[str, bytes | str]]],
+) -> None:
+    dest_con.execute("PRAGMA busy_timeout = 30000")
+    dest_con.execute("BEGIN IMMEDIATE")
+    try:
+        for row in headers:
+            dest_con.execute(
+                """
+                INSERT INTO composerHeaders (
+                    composerId, workspaceId, createdAt, lastUpdatedAt,
+                    isArchived, isSubagent, recency, checkpointAt,
+                    value, subagentTypeName
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(composerId) DO UPDATE SET
+                    workspaceId=excluded.workspaceId,
+                    createdAt=excluded.createdAt,
+                    lastUpdatedAt=excluded.lastUpdatedAt,
+                    isArchived=excluded.isArchived,
+                    isSubagent=excluded.isSubagent,
+                    recency=excluded.recency,
+                    checkpointAt=excluded.checkpointAt,
+                    value=excluded.value,
+                    subagentTypeName=excluded.subagentTypeName
+                """,
+                (
+                    row["composerId"],
+                    row["workspaceId"],
+                    row["createdAt"],
+                    row["lastUpdatedAt"],
+                    row["isArchived"],
+                    row["isSubagent"],
+                    row["recency"],
+                    row["checkpointAt"],
+                    row["value"],
+                    row["subagentTypeName"],
+                ),
+            )
+            composer_id = row["composerId"]
+            data = None
+            for key, value in kv_rows.get(composer_id, []):
+                dest_con.execute(
+                    "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                    (key, value),
+                )
+                if key.startswith("composerData:"):
+                    data = value
+            n_chunks = chunk_count_from_composer_data(data)
+            for index in range(n_chunks, n_chunks + 40):
+                dest_con.execute(
+                    "DELETE FROM cursorDiskKV WHERE key = ?",
+                    (conv_header_key(composer_id, index),),
+                )
+        dest_con.commit()
+    except Exception:
+        dest_con.rollback()
+        raise
+    dest_con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    result = dest_con.execute("PRAGMA integrity_check").fetchone()
+    if not result or result[0] != "ok":
+        raise SystemExit(f"integrity_check failed: {result}")
+
+
+def cmd_sync_chats(args: argparse.Namespace) -> None:
+    folder = Path(args.folder).expanduser().resolve()
+    if not folder.exists():
+        raise SystemExit(f"folder not found: {folder}")
+    from_dir = Path(args.from_dir).expanduser().resolve()
+    to_dir = Path(args.to_dir).expanduser().resolve()
+    if from_dir == to_dir:
+        raise SystemExit("source and destination data dirs are the same")
+    src_kind = data_dir_kind(from_dir)
+    dest_kind = data_dir_kind(to_dir)
+    days = int(args.days)
+    max_bytes = int(args.max_mb) * 1024 * 1024
+    workspace_id = workspace_id_for_folder(from_dir, folder)
+    if not workspace_id:
+        raise SystemExit(f"no workspaceStorage entry for {folder} in {from_dir}")
+
+    src = connect(state_db(from_dir), readonly=True)
+    try:
+        rows = list_workspace_chats(src, workspace_id)
+        chosen, total, used_days = pick_chats(src, rows, days, max_bytes)
+        if not chosen:
+            raise SystemExit(
+                f"no chats in this workspace from the last {days} days"
+            )
+        chosen_dicts = [{key: row[key] for key in row.keys()} for row in chosen]
+        kv_rows = {
+            item["composerId"]: collect_chat_keys(src, item["composerId"])
+            for item in chosen_dicts
+        }
+    finally:
+        src.close()
+    chosen = chosen_dicts
+
+    dest_running = bool(pids_for(dest_kind))
+    dest_con_ro = connect(state_db(to_dir), readonly=True)
+    try:
+        existing = dest_header_map(
+            dest_con_ro, [row["composerId"] for row in chosen]
+        )
+    finally:
+        dest_con_ro.close()
+
+    copy_rows = []
+    skipped = []
+    for row in chosen:
+        dest_ts = existing.get(row["composerId"])
+        if dest_ts is not None and dest_ts > int(row["lastUpdatedAt"] or 0):
+            skipped.append(row)
+            continue
+        copy_rows.append(row)
+
+    report = {
+        "ok": True,
+        "folder": str(folder),
+        "workspaceId": workspace_id,
+        "from": str(from_dir),
+        "to": str(to_dir),
+        "days": used_days,
+        "bytes": total,
+        "copy": len(copy_rows),
+        "skipNewerOnDest": [
+            {
+                "id": row["composerId"],
+                "name": header_name(row["value"]),
+            }
+            for row in skipped
+        ],
+        "names": [header_name(row["value"]) for row in copy_rows[:12]],
+        "destRunning": dest_running,
+        "dryRun": bool(args.dry_run),
+    }
+    if args.dry_run or not copy_rows:
+        print(json.dumps(report, ensure_ascii=False))
+        return
+
+    lock_fd = acquire_sync_lock()
+    try:
+        if dest_running:
+            print(f"quitting {dest_kind} Cursor only", file=sys.stderr, flush=True)
+            quit_kind(dest_kind)
+        ensure_workspace_json(to_dir, workspace_id, folder)
+        dest = connect(state_db(to_dir), readonly=False)
+        try:
+            backup_dest_chats(dest, [row["composerId"] for row in copy_rows])
+            write_chats(dest, copy_rows, kv_rows)
+        finally:
+            dest.close()
+        print("copied, relaunching destination", file=sys.stderr, flush=True)
+        launch_kind(dest_kind)
+    finally:
+        release_sync_lock(lock_fd)
+    print(json.dumps(report, ensure_ascii=False))
 
 
 def current_account_name(email: str) -> str | None:
@@ -344,6 +833,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = sub.add_parser("toggle", help="quit Cursor and switch to the other saved account")
     g.set_defaults(func=cmd_toggle)
+
+    y = sub.add_parser(
+        "sync-chats",
+        help="copy this workspace's recent chats into the other Cursor data dir",
+    )
+    y.add_argument("--from-dir", required=True)
+    y.add_argument("--to-dir", required=True)
+    y.add_argument("--folder", required=True)
+    y.add_argument("--days", type=int, default=DEFAULT_SYNC_DAYS)
+    y.add_argument("--max-mb", type=int, default=DEFAULT_MAX_MB)
+    y.add_argument("--dry-run", action="store_true")
+    y.set_defaults(func=cmd_sync_chats)
 
     return p
 
