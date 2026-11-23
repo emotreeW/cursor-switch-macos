@@ -1,8 +1,29 @@
 # cursor-switch
 
-macOS CLI that switches Cursor logins inside the **default** data directory so chat history stays put.
+macOS CLI and Cursor extension that switch Cursor logins inside the **default** data directory so chat history stays put.
 
 A switch quits Cursor and relaunches it. Unofficial; Cursor can change this storage in any release.
+
+## Install
+
+```bash
+./install.sh
+```
+
+Reload the Cursor window (`Developer: Reload Window`). The status bar shows the current plan; click it to switch. Command Palette:
+
+- `Cursor Switch: Toggle Account`
+- `Cursor Switch: Switch to Super`
+- `Cursor Switch: Switch to Pro+`
+
+First-time capture (already done on this machine):
+
+```bash
+cursor-switch capture super
+cursor-switch capture proplus --from "$HOME/Library/Application Support/Cursor-ProPlus"
+```
+
+CLI equivalent: `cursor-switch toggle`.
 
 ## Prior art
 
@@ -19,29 +40,6 @@ This tool follows the same public method: replace `cursorAuth/%` and `glass.last
 - Chats and current login: `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
 - Captured sessions (local, not in git): `~/.config/cursor-switch/accounts/`
 - Optional second instance: `~/Library/Application Support/Cursor-ProPlus`
-
-## Usage
-
-```bash
-chmod +x cursor-switch
-mkdir -p ~/.local/bin
-ln -sf "$(pwd)/cursor-switch" ~/.local/bin/cursor-switch
-
-# Account currently signed in to the default window
-cursor-switch capture super
-
-# Account already signed in via --user-data-dir
-cursor-switch capture proplus --from "$HOME/Library/Application Support/Cursor-ProPlus"
-
-cursor-switch list
-cursor-switch status
-
-# Quit every Cursor process, write that login into the default dir, relaunch
-cursor-switch to proplus
-cursor-switch to super
-```
-
-`to` refreshes the saved session for whoever is currently in the default dir before swapping, so a just-rotated token is not lost.
 
 ## License
 

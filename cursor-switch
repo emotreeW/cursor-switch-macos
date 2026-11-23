@@ -147,10 +147,51 @@ def launch_default_cursor() -> None:
     subprocess.run(["open", "-a", "Cursor"], check=True)
 
 
+def current_account_name(email: str) -> str | None:
+    if not email or not ACCOUNTS_DIR.exists():
+        return None
+    for path in ACCOUNTS_DIR.glob("*.json"):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("email") == email:
+            return data.get("name") or path.stem
+    return None
+
+
+def other_account_name(email: str) -> str:
+    names = []
+    if ACCOUNTS_DIR.exists():
+        for path in sorted(ACCOUNTS_DIR.glob("*.json")):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            name = data.get("name") or path.stem
+            if data.get("email") == email:
+                continue
+            names.append(name)
+    if len(names) == 1:
+        return names[0]
+    if not names:
+        raise SystemExit("capture a second account first")
+    raise SystemExit(f"pick an account: cursor-switch to <name>  (saved: {', '.join(names)})")
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     keys = read_auth_rows(DEFAULT_DATA_DIR)
     info = summarize(keys)
+    name = current_account_name(info["email"])
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "email": info["email"],
+                    "membership": info["membership"],
+                    "status": info["status"],
+                    "name": name,
+                    "running": bool(cursor_pids()),
+                }
+            )
+        )
+        return
     print(f"data dir: {DEFAULT_DATA_DIR}")
+    print(f"name:     {name or '(unsaved)'}")
     print(f"email:    {info['email'] or '(none)'}")
     print(f"plan:     {info['membership'] or '(unknown)'} {info['status']}".rstrip())
     print(f"running:  {'yes' if cursor_pids() else 'no'}")
@@ -236,21 +277,41 @@ def refresh_if_logged_in(name_guess: str | None) -> None:
     print(f"refreshed saved session for {target_name} ({email})")
 
 
-def cmd_to(args: argparse.Namespace) -> None:
-    target = load_account(args.name)
+def switch_to(name: str) -> None:
+    target = load_account(name)
     keys = target.get("keys") or {}
     if "cursorAuth/accessToken" not in keys:
-        raise SystemExit(f"saved account {args.name!r} has no accessToken")
+        raise SystemExit(f"saved account {name!r} has no accessToken")
     refresh_if_logged_in(None)
+    STORE_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = STORE_DIR / "last-switch.log"
+    log_path.write_text(
+        f"{datetime.now(timezone.utc).isoformat()} switching to {name} "
+        f"{target.get('email')} ({target.get('membership')})\n",
+        encoding="utf-8",
+    )
     print(
         f"switching default Cursor to {target.get('email')} "
         f"({target.get('membership')})"
     )
     print("quitting Cursor (this window will close)")
+    sys.stdout.flush()
     quit_cursor()
     write_auth_rows(DEFAULT_DATA_DIR, keys)
     launch_default_cursor()
-    print("relaunched Cursor with the default data directory (all chats stay)")
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(f"{datetime.now(timezone.utc).isoformat()} relaunched as {name}\n")
+    print("relaunched Cursor with the default data directory")
+
+
+def cmd_to(args: argparse.Namespace) -> None:
+    switch_to(args.name)
+
+
+def cmd_toggle(_args: argparse.Namespace) -> None:
+    live = read_auth_rows(DEFAULT_DATA_DIR)
+    email = live.get("cursorAuth/cachedEmail", "")
+    switch_to(other_account_name(email))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -261,6 +322,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("status", help="show who the default Cursor data dir is signed in as")
+    s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_status)
 
     c = sub.add_parser("capture", help="save login rows from a Cursor data dir")
@@ -279,6 +341,9 @@ def build_parser() -> argparse.ArgumentParser:
     t = sub.add_parser("to", help="quit Cursor, write saved login into the default dir, relaunch")
     t.add_argument("name")
     t.set_defaults(func=cmd_to)
+
+    g = sub.add_parser("toggle", help="quit Cursor and switch to the other saved account")
+    g.set_defaults(func=cmd_toggle)
 
     return p
 

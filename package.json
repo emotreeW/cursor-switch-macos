@@ -1,0 +1,33 @@
+{
+  "name": "cursor-switch",
+  "displayName": "Cursor Switch",
+  "description": "Switch Cursor logins in the default data directory from the status bar.",
+  "version": "0.0.1",
+  "publisher": "emotreeW",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "cursorSwitch.toggle",
+        "title": "Toggle Account",
+        "category": "Cursor Switch"
+      },
+      {
+        "command": "cursorSwitch.to.super",
+        "title": "Switch to Super",
+        "category": "Cursor Switch"
+      },
+      {
+        "command": "cursorSwitch.to.proplus",
+        "title": "Switch to Pro+",
+        "category": "Cursor Switch"
+      }
+    ]
+  }
+}
