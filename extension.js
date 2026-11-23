@@ -31,14 +31,22 @@ function dataDirFromExtension(context) {
   return path.resolve(context.globalStorageUri.fsPath, "..", "..", "..");
 }
 
+function defaultDataDir() {
+  return path.join(process.env.HOME || "", "Library/Application Support/Cursor");
+}
+
+function proplusDataDir() {
+  return path.join(
+    process.env.HOME || "",
+    "Library/Application Support/Cursor-ProPlus"
+  );
+}
+
 function otherDataDir(fromDir) {
-  const home = process.env.HOME || "";
-  const proplus = path.join(home, "Library/Application Support/Cursor-ProPlus");
-  const def = path.join(home, "Library/Application Support/Cursor");
-  if (path.resolve(fromDir) === path.resolve(proplus)) {
-    return def;
+  if (path.resolve(fromDir) === path.resolve(proplusDataDir())) {
+    return defaultDataDir();
   }
-  return proplus;
+  return proplusDataDir();
 }
 
 function stateDbPath(context) {
@@ -247,8 +255,8 @@ async function activate(context) {
         vscode.window.showErrorMessage("Open a folder first.");
         return;
       }
-      const fromDir = dataDirFromExtension(context);
-      const toDir = otherDataDir(fromDir);
+      const fromDir = defaultDataDir();
+      const toDir = proplusDataDir();
       const folder = folders[0].uri.fsPath;
       const choice = await vscode.window.showWarningMessage(
         `Copy every chat in this workspace that was used in the last 7 days (the full thread, not just the last week's messages), then quit and reopen the other window? This window stays open. Destination chats that are newer are left alone.`,

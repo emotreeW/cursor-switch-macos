@@ -85,20 +85,32 @@ def read_auth_rows(data_dir: Path) -> dict[str, str]:
 
 
 def write_auth_rows(data_dir: Path, keys: dict[str, str]) -> None:
+    if "cursorAuth/accessToken" not in keys:
+        raise SystemExit("refusing to write auth rows: no accessToken")
     db = state_db(data_dir)
     con = connect(db, readonly=False)
     try:
-        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.execute("BEGIN IMMEDIATE")
         con.execute(f"DELETE FROM ItemTable WHERE {AUTH_SQL}")
         con.executemany(
             "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
             list(keys.items()),
         )
         con.commit()
-        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        result = con.execute("PRAGMA integrity_check").fetchone()
-        if not result or result[0] != "ok":
-            raise SystemExit(f"integrity_check failed: {result}")
+        remaining = {
+            row["key"]
+            for row in con.execute(
+                f"SELECT key FROM ItemTable WHERE {AUTH_SQL}"
+            )
+        }
+        if "cursorAuth/accessToken" not in remaining:
+            raise SystemExit("auth write did not persist accessToken")
+    except Exception:
+        try:
+            con.rollback()
+        except sqlite3.Error:
+            pass
+        raise
     finally:
         con.close()
 
@@ -125,30 +137,6 @@ def cursor_pids() -> list[int]:
         except ValueError:
             continue
     return pids
-
-
-def quit_cursor(timeout: float = 40.0) -> None:
-    pids = cursor_pids()
-    if not pids:
-        return
-    subprocess.run(
-        ["osascript", "-e", 'tell application "Cursor" to quit'],
-        check=False,
-        capture_output=True,
-    )
-    deadline = time.time() + timeout
-    force_after = time.time() + timeout / 2
-    while time.time() < deadline:
-        pids = cursor_pids()
-        if not pids:
-            return
-        if time.time() > force_after:
-            subprocess.run(["kill", "-9", *map(str, pids)], check=False)
-            force_after = deadline + 1
-        time.sleep(0.3)
-    raise SystemExit(
-        "Cursor did not quit. Close every Cursor window, then run again."
-    )
 
 
 def launch_default_cursor(folder: Path | None = None) -> None:
@@ -588,6 +576,11 @@ def cmd_sync_chats(args: argparse.Namespace) -> None:
         raise SystemExit("source and destination data dirs are the same")
     src_kind = data_dir_kind(from_dir)
     dest_kind = data_dir_kind(to_dir)
+    if dest_kind == "default":
+        raise SystemExit(
+            "refusing to write the default Cursor database "
+            f"({DEFAULT_DATA_DIR}). Sync only copies into Cursor-ProPlus."
+        )
     days = int(args.days)
     max_bytes = int(args.max_mb) * 1024 * 1024
     workspace_id = workspace_id_for_folder(from_dir, folder)
@@ -819,9 +812,9 @@ def switch_to(name: str) -> None:
         f"switching default Cursor to {target.get('email')} "
         f"({target.get('membership')})"
     )
-    print("quitting Cursor (this window will close)")
+    print("quitting the default Cursor window only (Pro+ stays)")
     sys.stdout.flush()
-    quit_cursor()
+    quit_kind("default")
     write_auth_rows(DEFAULT_DATA_DIR, keys)
     launch_default_cursor()
     with log_path.open("a", encoding="utf-8") as fh:

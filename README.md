@@ -13,7 +13,7 @@ Unofficial. Cursor can change this storage in any release.
 Reload the Cursor window (`Developer: Reload Window`). The account chip on the status bar opens a menu:
 
 - **Open other window** — keep this window; focus the other account or launch it. Super uses the default data dir; Pro+ uses `--user-data-dir` `~/Library/Application Support/Cursor-ProPlus`. Never launches a second copy of the default dir (two writers on one `state.vscdb` corrupt it).
-- **Sync chats** — copy this workspace's recently used threads (full history) into the other account, then quit and reopen **that** window only.
+- **Sync chats** — copy this workspace's recently used threads (full history) from the default Super database **into Cursor-ProPlus only**. It never writes the 31 GB default `state.vscdb` chat tables. Then it quits and reopens the Pro+ window only.
 - **Switch login** — quit this window and swap the login inside the default data dir.
 
 A second chip shows **Grok** or **DeepSeek** and clicks Cursor's own `Toggle OpenAI key` (`Cmd+Shift+0`). Cursor still has no per-model base URL: Grok and DeepSeek cannot stay on at the same time. After a toggle, pick the matching model in the current chat.

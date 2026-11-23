@@ -2,7 +2,7 @@
   "name": "cursor-switch",
   "displayName": "Cursor Switch",
   "description": "Open the other Cursor account, sync this workspace's chats, switch login, and toggle DeepSeek.",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "publisher": "emotreeW",
   "license": "MIT",
   "engines": {
